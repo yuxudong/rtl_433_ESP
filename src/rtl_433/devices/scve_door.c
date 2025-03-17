@@ -30,48 +30,71 @@ with a repeat gap of 4 pulse widths, i.e.:
 
 #include "decoder.h"
 
-static int generic_motion_callback(r_device *decoder, bitbuffer_t *bitbuffer)
+static int scve_door_callback(r_device *decoder, bitbuffer_t *bitbuffer)
 {
     for (int i = 0; i < bitbuffer->num_rows; ++i) {
         uint8_t *b = bitbuffer->bb[i];
+
+        b[0] = ~b[0];
+        b[1] = ~b[1];
+        b[2] = ~b[2];
+
         // strictly validate package as there is no checksum
-        if ((bitbuffer->bits_per_row[i] != 20)
-                || ((b[1] == 0) && (b[2] == 0))
-                || ((b[1] == 0xff) && (b[2] == 0xf0))
+        if ((bitbuffer->bits_per_row[i] != 25)
+                || (b[3] & 0x80) == 0 // Last bit (MSB here) is always 1
+                || ((b[0] == 0) && (b[1] == 0))
+                || ((b[2] == 0))
                 || bitbuffer_count_repeats(bitbuffer, i, 0) < 3)
             continue; // DECODE_ABORT_EARLY
 
         int code = (b[0] << 12) | (b[1] << 4) | (b[2] >> 4);
         char code_str[6];
-        snprintf(code_str, sizeof(code_str), "%05x", code);
+        snprintf(code_str, sizeof(code_str), "%04x", code);
+        
+        char *cmd;
+        switch(b[2] & 0x0f) {
+            case 1:
+                cmd="Down";
+                break;
+            case 4:
+                cmd="Stop";
+                break;
+            case 8:
+                cmd="Up";
+                break;
+            default:
+                cmd="Unknown";
+        }
 
         /* clang-format off */
         data_t *data = data_make(
-                "model",    "",  DATA_STRING, "Generic-Motion",
-                "code",     "",  DATA_STRING, code_str,
+                "model",    "",  DATA_STRING, "SCVE Door",
+                "id",     "",   DATA_STRING, code_str,
+                "button", "",   DATA_STRING, cmd,
                 NULL);
         /* clang-format on */
 
         decoder_output_data(decoder, data);
         return 1;
-    }
+    }   
     return DECODE_ABORT_EARLY;
 }
 
 static char const *const output_fields[] = {
         "model",
-        "code",
+        "id",
+        "button",
         NULL,
 };
 
-r_device const generic_motion = {
-        .name        = "Generic wireless motion sensor",
+r_device const scve_door = {
+        .name        = "scve_door",
         .modulation  = OOK_PULSE_PWM,
-        .short_width = 888,
-        .long_width  = (1332 + 1784) / 2,
-        .sync_width  = 1784 + 670,
-        .gap_limit   = 1200,
-        .reset_limit = 2724 * 1.5,
-        .decode_fn   = &generic_motion_callback,
+        .short_width = 315,
+        .long_width  = 945,
+        .sync_width  = 0,
+        .gap_limit   = 9450,
+        .reset_limit = 200000,
+        .decode_fn   = &scve_door_callback,
         .fields      = output_fields,
 };

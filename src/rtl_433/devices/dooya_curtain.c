@@ -30,25 +30,53 @@ with a repeat gap of 4 pulse widths, i.e.:
 
 #include "decoder.h"
 
-static int generic_motion_callback(r_device *decoder, bitbuffer_t *bitbuffer)
+static int dooya_curtain_callback(r_device *decoder, bitbuffer_t *bitbuffer)
 {
     for (int i = 0; i < bitbuffer->num_rows; ++i) {
         uint8_t *b = bitbuffer->bb[i];
+
+        b[0] = ~b[0];
+        b[1] = ~b[1];
+        b[2] = ~b[2];
+        b[3] = ~b[3];
+        b[4] = ~b[4];
+
         // strictly validate package as there is no checksum
-        if ((bitbuffer->bits_per_row[i] != 20)
-                || ((b[1] == 0) && (b[2] == 0))
-                || ((b[1] == 0xff) && (b[2] == 0xf0))
-                || bitbuffer_count_repeats(bitbuffer, i, 0) < 3)
+        if ((bitbuffer->bits_per_row[i] != 40)
+                || ((b[0] == 0) && (b[1] == 0) && (b[2] == 0))
+                || ((b[3] == 0))
+                || ((b[4] == 0))
+                || bitbuffer_count_repeats(bitbuffer, i, 0) < 5)
             continue; // DECODE_ABORT_EARLY
 
-        int code = (b[0] << 12) | (b[1] << 4) | (b[2] >> 4);
-        char code_str[6];
-        snprintf(code_str, sizeof(code_str), "%05x", code);
+        int id = (b[0] << 16) | (b[1] << 8) | b[2];
+        char id_str[8];
+        snprintf(id_str, sizeof(id_str), "%06x", id);
+        
+        int channel=b[3];
+
+
+        char *button;
+        switch(b[4] & 0x0f) {
+            case 1:
+                button="Open";
+                break;
+            case 3:
+                button="Close";
+                break;
+            case 5:
+                button="Stop";
+                break;
+            default:
+                button="Unknown";
+        }
 
         /* clang-format off */
         data_t *data = data_make(
-                "model",    "",  DATA_STRING, "Generic-Motion",
-                "code",     "",  DATA_STRING, code_str,
+                "model",    "",  DATA_STRING, "Dooya Curtain",
+                "id",     "",   DATA_STRING, id_str,
+                "channel", "",  DATA_INT, channel,
+                "button", "",   DATA_STRING, button,
                 NULL);
         /* clang-format on */
 
@@ -60,18 +88,21 @@ static int generic_motion_callback(r_device *decoder, bitbuffer_t *bitbuffer)
 
 static char const *const output_fields[] = {
         "model",
-        "code",
+        "id",
+        "channel",
+        "button",
         NULL,
 };
 
-r_device const generic_motion = {
-        .name        = "Generic wireless motion sensor",
+r_device const dooya_curtain = {
+        .name        = "dooya_curtain",
         .modulation  = OOK_PULSE_PWM,
-        .short_width = 888,
-        .long_width  = (1332 + 1784) / 2,
-        .sync_width  = 1784 + 670,
-        .gap_limit   = 1200,
-        .reset_limit = 2724 * 1.5,
-        .decode_fn   = &generic_motion_callback,
+        .short_width = 350,
+        .long_width  = 750,
+        .sync_width  = 4900,
+        .gap_limit   = 990,
+        .reset_limit = 9900,
+        .disabled   = 0,
+        .decode_fn   = &dooya_curtain_callback,
         .fields      = output_fields,
 };

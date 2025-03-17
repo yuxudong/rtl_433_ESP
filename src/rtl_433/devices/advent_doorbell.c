@@ -30,28 +30,34 @@ with a repeat gap of 4 pulse widths, i.e.:
 
 #include "decoder.h"
 
-static int generic_motion_callback(r_device *decoder, bitbuffer_t *bitbuffer)
+static int advent_doorbell_callback(r_device *decoder, bitbuffer_t *bitbuffer)
 {
+    //bitbuffer_print(bitbuffer);
     for (int i = 0; i < bitbuffer->num_rows; ++i) {
         uint8_t *b = bitbuffer->bb[i];
-        // strictly validate package as there is no checksum
-        if ((bitbuffer->bits_per_row[i] != 20)
-                || ((b[1] == 0) && (b[2] == 0))
-                || ((b[1] == 0xff) && (b[2] == 0xf0))
-                || bitbuffer_count_repeats(bitbuffer, i, 0) < 3)
-            continue; // DECODE_ABORT_EARLY
-
-        int code = (b[0] << 12) | (b[1] << 4) | (b[2] >> 4);
+        if(bitbuffer->bits_per_row[i] == 15) {
+            int bit = b[1]>>7 & 1;
+            b[1] = b[1]<<1;
+            b[0] = b[0]<<1 | bit;
+        }
+        if(bitbuffer->bits_per_row[i] == 16) {
+            int bit = b[1]>>6 & 3;
+            b[1] = b[1]<<2;
+            b[0] = b[0]<<2 | bit;
+        }
+        if ((bitbuffer->bits_per_row[i] < 15)
+                || b[0] == 0
+                || b[1] == 0)
+            continue;
+        int code = (b[0] << 8) | b[1];
         char code_str[6];
-        snprintf(code_str, sizeof(code_str), "%05x", code);
-
+        snprintf(code_str, sizeof(code_str), "%04x", code);
         /* clang-format off */
         data_t *data = data_make(
-                "model",    "",  DATA_STRING, "Generic-Motion",
+                "model",    "",  DATA_STRING, "Advent Doorbell",
                 "code",     "",  DATA_STRING, code_str,
                 NULL);
         /* clang-format on */
-
         decoder_output_data(decoder, data);
         return 1;
     }
@@ -64,14 +70,15 @@ static char const *const output_fields[] = {
         NULL,
 };
 
-r_device const generic_motion = {
-        .name        = "Generic wireless motion sensor",
+r_device const advent_doorbell = {
+        .name        = "advent_doorbell",
         .modulation  = OOK_PULSE_PWM,
-        .short_width = 888,
-        .long_width  = (1332 + 1784) / 2,
-        .sync_width  = 1784 + 670,
-        .gap_limit   = 1200,
-        .reset_limit = 2724 * 1.5,
-        .decode_fn   = &generic_motion_callback,
+        .short_width = 50,
+        .long_width  = 150,
+        .sync_width  = 0,
+        .gap_limit   = 1500,
+        .reset_limit = 200000,
+        .disabled   = 0,
+        .decode_fn   = &advent_doorbell_callback,
         .fields      = output_fields,
 };

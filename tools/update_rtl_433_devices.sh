@@ -6,7 +6,7 @@ export FSK_MODULATION="FSK_PULSE_MANCHESTER_ZEROBIT|FSK_PULSE_PCM|FSK_PULSE_PWM"
 
 rm copy.list devices.list decoder.fragment
 
-( cd .. ; rm -rf rtl_433 ; git clone https://github.com/merbanan/rtl_433 )
+( cd .. ; rm -rf rtl_433 ; git clone https://github.com/yuxudong/rtl_433 )
 ( cd ../rtl_433/src/devices/ ; egrep "\.name|\.modulation|\.decode_fn|^r_device " *.c ) |\
     awk -f device.awk | awk -F : '{ print $1 }' | sort | uniq > copy.list
 
