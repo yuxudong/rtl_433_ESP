@@ -250,6 +250,9 @@ void rtlSetup() {
       memcpy(&cfg->devices[161], &X10_RF, sizeof(r_device));
       memcpy(&cfg->devices[162], &x10_sec, sizeof(r_device));
       memcpy(&cfg->devices[163], &yale_hsa, sizeof(r_device));
+      memcpy(&cfg->devices[164], &advent_doorbell, sizeof(r_device));
+      memcpy(&cfg->devices[165], &dooya_curtain, sizeof(r_device));
+      memcpy(&cfg->devices[166], &scve_door, sizeof(r_device));
     } else {
       memcpy(&cfg->devices[0], &ambientweather_wh31e, sizeof(r_device));
       memcpy(&cfg->devices[1], &ant_antplus, sizeof(r_device));
