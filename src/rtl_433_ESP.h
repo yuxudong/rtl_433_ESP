@@ -118,7 +118,7 @@
 // cannot be received without editing the library.
 #if OOK_MODULATION
 #  ifndef MINIMUM_PULSE_LENGTH
-#    define MINIMUM_PULSE_LENGTH 50
+#    define MINIMUM_PULSE_LENGTH 30
 #  endif
 #  ifndef MINIMUM_SIGNAL_LENGTH
 #    define MINIMUM_SIGNAL_LENGTH 40000

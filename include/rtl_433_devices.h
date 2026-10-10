@@ -18,6 +18,7 @@
     DECL(acurite_00275rm)                 \
     DECL(acurite_590tx)                   \
     DECL(acurite_01185m)                  \
+    DECL(advent_doorbell)                 \
     DECL(akhan_100F14)                    \
     DECL(alectov1)                        \
     DECL(alps_fwb1u545_car_remote)        \
@@ -387,7 +388,7 @@
     DECL(x10_sec)                         \
     DECL(yale_hsa)                        \
     /* Add new decoders here. */
-#  define NUMOF_OOK_DEVICES 223
+#  define NUMOF_OOK_DEVICES 224
 #  define NUMOF_FSK_DEVICES 153
 /* Add new decoders here. */
 #else
