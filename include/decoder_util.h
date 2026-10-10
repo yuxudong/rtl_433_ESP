@@ -31,6 +31,12 @@
 /// Create a new r_device, copy from dev_template if not NULL.
 r_device *create_device(r_device const *dev_template);
 
+/// Create a new r_device, copy from dev_template if not NULL and allocate user data.
+r_device *decoder_create(r_device const *dev_template, unsigned user_data_size);
+
+/// Get the decoder user data allocated by decoder_create().
+void *decoder_user_data(r_device *decoder);
+
 /// Output data.
 void decoder_output_data(r_device *decoder, data_t *data);
 
