@@ -24,15 +24,19 @@
 
 #include <rtl_433_ESP.h>
 
-#include "receiver.h"
+#include "capture_utils.h"
 #include "signalDecoder.h"
+
+extern "C" unsigned long rtl_433_millis(void) { return millis(); }
 
 /*----------------------------- Transceiver SPI Connections -----------------------------*/
 
 #if defined(RF_MODULE_SCK) && defined(RF_MODULE_MISO) && \
     defined(RF_MODULE_MOSI) && defined(RF_MODULE_CS)
 #  include <SPI.h>
-#  if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
+#  if defined(CONFIG_IDF_TARGET_ESP32C3) || \
+      defined(CONFIG_IDF_TARGET_ESP32S3) || \
+      defined(CONFIG_IDF_TARGET_ESP32C5)
 SPIClass newSPI(FSPI);
 #  else
 SPIClass newSPI(VSPI);
@@ -51,11 +55,16 @@ SX1278 radio = RADIO_LIB_MODULE;
 CC1101 radio = RADIO_LIB_MODULE;
 #endif
 
+#ifdef RF_DUAL_CC1101
+CC1101 radio2 = RADIO_LIB_MODULE2;
+#endif
+
 #if defined(RF_SX1276) || defined(RF_SX1278)
 uint8_t rtl_433_ESP::OokFixedThreshold = OOK_FIXED_THRESHOLD;
 #endif
 
 Module* _mod = radio.getMod();
+volatile bool rtl_433_radio_config_failed = false;
 
 /*----------------------------- rtl_433_ESP Internals -----------------------------*/
 
@@ -63,12 +72,30 @@ Module* _mod = radio.getMod();
 #define rtl_433_ReceiverTask_Priority 2
 #define rtl_433_ReceiverTask_Core     0
 
+// Preserve a short history of demodulator edges while the RSSI task is still
+// deciding that a signal is present. This avoids losing short protocol
+// preambles to the receiver task's millisecond polling interval. Set
+// PRETRIGGER_ENABLED=0 to build the legacy capture path for comparison tests.
+#ifndef PRETRIGGER_ENABLED
+#  define PRETRIGGER_ENABLED 1
+#endif
+#define PRETRIGGER_WINDOW_US 4000
+#define PRETRIGGER_PAIRS     32
+
 /*----------------------------- Initialize variables -----------------------------*/
 
 /**
  * Is the receiver currently receiving a signal
  */
 static bool receiveMode = false;
+
+#if PRETRIGGER_ENABLED
+static volatile unsigned int _pretriggerPulse[PRETRIGGER_PAIRS];
+static volatile unsigned int _pretriggerGap[PRETRIGGER_PAIRS];
+static volatile uint8_t _pretriggerHead = 0;
+static volatile uint8_t _pretriggerCount = 0;
+static volatile unsigned int _pretriggerPendingPulse = 0;
+#endif
 
 /**
  * Timestamp in micros for start of current signal
@@ -79,6 +106,16 @@ static unsigned long signalStart = micros();
  * Timestamp in micros for end of most recent message aka start of current gap
  */
 static unsigned long gapStart = micros();
+
+// Return a forward micros() interval, but clamp timestamps that are ordered
+// backwards. The signed modular comparison preserves normal micros() rollover
+// handling while preventing pre-trigger timestamps from underflowing when
+// they extend before gapStart.
+static unsigned long elapsedMicrosOrZero(unsigned long end,
+                                         unsigned long start) {
+  const long elapsed = static_cast<long>(end - start);
+  return elapsed > 0 ? static_cast<unsigned long>(elapsed) : 0;
+}
 
 /**
  * Timestamp in micros for end of most recent signal
@@ -104,12 +141,22 @@ volatile int16_t rtl_433_ESP::_nrpulses;
 int rtl_433_ESP::totalSignals = 0;
 int rtl_433_ESP::ignoredSignals = 0;
 int rtl_433_ESP::unparsedSignals = 0;
+volatile unsigned int rtl_433_ESP::decoderSignals = 0;
+volatile unsigned int rtl_433_ESP::decodedMessages = 0;
+volatile unsigned int rtl_433_ESP::zeroDecodedSignals = 0;
+volatile unsigned int rtl_433_ESP::droppedCaptureBuffers = 0;
+volatile unsigned int rtl_433_ESP::droppedDecoderQueue = 0;
 int signalRatio = 0;
 
 // RSSI Threshold and average calculation
 
 int rtl_433_ESP::averageRssi = 0;
 int rtl_433_ESP::rssiThresholdDelta = RSSI_THRESHOLD;
+static int _peakRssi = -256; // per-cycle peak, reset when reported
+static int _aboveThreshold = 0; // samples in the cycle that cleared the gate
+#ifdef AUTORSSITHRESHOLD
+static bool _rssiCalibrated = false;
+#endif
 
 bool rtl_433_ESP::ookModulation = OOK_MODULATION; // Defaults to true
 
@@ -123,16 +170,86 @@ unsigned long _deafWorkaround = millis();
 #endif
 
 int16_t rtl_433_ESP::_interrupt = NOT_AN_INTERRUPT;
-static byte receiverGpio = -1;
+static int8_t receiverGpio = -1;
 
 static TaskHandle_t rtl_433_ReceiverHandle;
+static portMUX_TYPE captureMux = portMUX_INITIALIZER_UNLOCKED;
+static bool initialized = false;
+static rtl_433_ESPError initializationError = rtl_433_ESPError::None;
+
+float rtl_433_ESP::receiveFrequencyMhz = 0;
+
+// Serialises SPI access between the receiver task (RSSI polling on its own
+// core) and every other context that touches a radio register (transmit
+// handover, retuning, the hourly deaf workaround). Created by initReceiver();
+// spiTake()/spiGive() degrade to no-ops before that.
+static SemaphoreHandle_t _spiMutex = NULL;
+
+bool rtl_433_ESP::spiTake(uint32_t waitMs) {
+  if (_spiMutex == NULL) {
+    return true;
+  }
+  TickType_t ticks =
+      (waitMs == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(waitMs);
+  return xSemaphoreTake(_spiMutex, ticks) == pdTRUE;
+}
+
+void rtl_433_ESP::spiGive() {
+  if (_spiMutex != NULL) {
+    xSemaphoreGive(_spiMutex);
+  }
+}
+
+#ifdef RF_DUAL_CC1101
+
+/*----------------------------- Second receive channel -----------------------------*/
+// Mirrors the primary channel's capture state one-for-one. Kept as a parallel
+// set of statics rather than folding both channels into a struct so the
+// hardware-proven primary path is not disturbed; the receiver task interleaves
+// the two channels, and completed trains from either feed the same decoder
+// queue, distinguished by pulse_data_t.centerfreq_hz.
+
+int rtl_433_ESP::messageCount2 = 0;
+int rtl_433_ESP::currentRssi2 = 0;
+int rtl_433_ESP::signalRssi2 = 0;
+int rtl_433_ESP::rssiThreshold2 = MINRSSI;
+int rtl_433_ESP::averageRssi2 = 0;
+
+static pulse_data_t* _pulseTrains2 = NULL;
+static bool _enabledReceiver2 = false;
+static bool receiveMode2 = false;
+static volatile uint8_t _actualPulseTrain2 = 0;
+static uint8_t _avaiablePulseTrain2 = 0;
+static volatile unsigned long _lastChange2 = 0;
+static volatile int16_t _nrpulses2 = 0;
+static int8_t receiverGpio2 = -1;
+static float _freq2Mhz = 0;
+
+static unsigned long signalStart2 = 0;
+static unsigned long signalEnd2 = 0;
+static unsigned long gapStart2 = 0;
+
+static int _totalRssi2 = 0;
+static int _rssiCount2 = 0;
+static int _peakRssi2 = -256;
+static int _aboveThreshold2 = 0;
+static int _noiseCount2 = 0;
+#  ifdef AUTORSSITHRESHOLD
+static bool _rssiCalibrated2 = false;
+#  endif
+
+#  if PRETRIGGER_ENABLED
+static volatile unsigned int _pretriggerPulse2[PRETRIGGER_PAIRS];
+static volatile unsigned int _pretriggerGap2[PRETRIGGER_PAIRS];
+static volatile uint8_t _pretriggerHead2 = 0;
+static volatile uint8_t _pretriggerCount2 = 0;
+static volatile unsigned int _pretriggerPendingPulse2 = 0;
+#  endif
+#endif
 
 /*----------------------------- End of variable initialization -----------------------------*/
 
-rtl_433_ESP::rtl_433_ESP() {
-  _pulseTrains = (pulse_data_t*)heap_caps_calloc(
-      RECEIVER_BUFFER_SIZE, sizeof(pulse_data_t), MALLOC_CAP_INTERNAL);
-}
+rtl_433_ESP::rtl_433_ESP() {}
 
 /**
  * @brief Initialize Transceiver and rtl_433 decoders
@@ -141,11 +258,37 @@ rtl_433_ESP::rtl_433_ESP() {
  * @param receiveFrequency - receive frequency
  */
 void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
+  begin(inputPin, receiveFrequency);
+}
+
+bool rtl_433_ESP::begin(byte inputPin, float receiveFrequency) {
+  if (initialized) {
+    return true;
+  }
+  if (inputPin == static_cast<byte>(NOT_AN_INTERRUPT)) {
+    initializationError = rtl_433_ESPError::InvalidArgument;
+    return false;
+  }
+  if (!_pulseTrains) {
+    // MALLOC_CAP_8BIT is load-bearing: INTERNAL alone may satisfy a large
+    // allocation from the IRAM heap, which only tolerates aligned 32-bit
+    // accesses — the byte-wise memcpy of a train (and FPU stores into it)
+    // then raise LoadStoreError. 8BIT restricts the allocation to DRAM.
+    _pulseTrains = static_cast<pulse_data_t*>(heap_caps_calloc(
+        RECEIVER_BUFFER_SIZE, sizeof(pulse_data_t),
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  if (!_pulseTrains) {
+    initializationError = rtl_433_ESPError::OutOfMemory;
+    return false;
+  }
+  rtl_433_radio_config_failed = false;
 #if defined(RF_SX1276) || defined(RF_SX1278)
   radio.reset();
 #endif
 
   receiverGpio = digitalPinToInterrupt(inputPin);
+  receiveFrequencyMhz = receiveFrequency;
 #ifdef MEMORY_DEBUG
   logprintfLn(LOG_INFO, "Pre initReceiver: %d", ESP.getFreeHeap());
 #endif
@@ -154,7 +297,10 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
   logprintfLn(LOG_INFO, STR_MODULE " receive frequency: %f", receiveFrequency);
 #endif
 
-  rtlSetup();
+  if (!rtlSetup()) {
+    initializationError = rtl_433_ESPError::QueueCreation;
+    return false;
+  }
 
 #ifdef MEMORY_DEBUG
   logprintfLn(LOG_INFO, "Post rtlSetup: %d", ESP.getFreeHeap());
@@ -177,7 +323,8 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
 #endif
   RADIOLIB_STATE(state, "radio.begin()");
 
-  radio.setFrequency(receiveFrequency);
+  state = radio.setFrequency(receiveFrequency);
+  RADIOLIB_STATE(state, "setFrequency");
   resetReceiver();
 #ifdef ONBOARD_LED
   pinMode(ONBOARD_LED, OUTPUT);
@@ -205,14 +352,23 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
 
     // Settings borrowed from lsatan
 
-    state = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL2, 0xc7);
+    state = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL2, CC1101_AGCCTRL2);
     RADIOLIB_STATE(state, "set AGCCTRL2");
+
+    state = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL1, CC1101_AGCCTRL1);
+    RADIOLIB_STATE(state, "set AGCCTRL1");
+
+    state = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL0, CC1101_AGCCTRL0);
+    RADIOLIB_STATE(state, "set AGCCTRL0");
 
     state = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_MDMCFG3, 0x93); // Data rate
     RADIOLIB_STATE(state, "set MDMCFG3");
 
-    state = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_MDMCFG4, 0x07); // Bandwidth
-    RADIOLIB_STATE(state, "set MDMCFG4");
+    // RadioLib updates only MDMCFG4.CHANBW_E/CHANBW_M and preserves the data
+    // rate exponent in the lower nibble. 812.0 selects the CC1101's actual
+    // 812.5 kHz setting with a 26 MHz crystal.
+    state = radio.setRxBandwidth(CC1101_RX_BANDWIDTH);
+    RADIOLIB_STATE(state, "setRxBandwidth");
   } else {
     // From https://github.com/matthias-bs/BresserWeatherSensorReceiver/issues/41#issuecomment-1458166772
     // radio.begin(868.3, 17.24, 40, 270, 10, 32);
@@ -312,6 +468,14 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
 #endif
   RADIOLIB_STATE(state, "receiveDirect");
 
+#if defined(RF_CC1101) && defined(CC1101_DATA_ON_GDO2)
+  // RadioLib routes async serial data to GDO0 only. Mirror it onto GDO2
+  // (IOCFG2 = 0x0D, serial data output) so boards that cannot use GDO0 as an
+  // input can receive on GDO2. Additive: GDO0 keeps its configuration.
+  state = radio.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2, 0x0D);
+  RADIOLIB_STATE(state, "IOCFG2 serial data out (GDO2)");
+#endif
+
 #ifdef RESOURCE_DEBUG
   logprintfLn(LOG_INFO, "rtl_433_ReceiverTask_Stack %d", rtl_433_ReceiverTask_Stack);
 #endif
@@ -320,8 +484,12 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
   getModuleStatus();
 #endif
 
+  if (_spiMutex == NULL) {
+    _spiMutex = xSemaphoreCreateMutex();
+  }
+
   if (!rtl_433_ReceiverHandle) {
-    xTaskCreatePinnedToCore(
+    BaseType_t taskCreated = xTaskCreatePinnedToCore(
         rtl_433_ESP::rtl_433_ReceiverTask, /* Function to implement the task */
         "rtl_433_ReceiverTask", /* Name of the task */
         rtl_433_ReceiverTask_Stack, /* Stack size in bytes */
@@ -329,21 +497,225 @@ void rtl_433_ESP::initReceiver(byte inputPin, float receiveFrequency) {
         rtl_433_ReceiverTask_Priority, /* Priority of the task (set lower than core task) */
         &rtl_433_ReceiverHandle, /* Task handle. */
         rtl_433_ReceiverTask_Core); /* Core where the task should run */
+    if (taskCreated != pdPASS) {
+      initializationError = rtl_433_ESPError::TaskCreation;
+      rtlShutdown();
+      return false;
+    }
   }
+  if (rtl_433_radio_config_failed) {
+    initializationError = rtl_433_ESPError::RadioInitialization;
+    end();
+    return false;
+  }
+  initialized = true;
+  initializationError = rtl_433_ESPError::None;
+  return true;
 }
+
+#ifdef RF_DUAL_CC1101
+/**
+ * @brief Initialize the second CC1101 as an additional receive channel.
+ * Must run after initReceiver(): the shared SPI bus is begun there and the
+ * receiver task this channel rides in is spawned there.
+ */
+bool rtl_433_ESP::initSecondaryReceiver(byte inputPin, float receiveFrequency) {
+  if (_pulseTrains2 == NULL) {
+    _pulseTrains2 = (pulse_data_t*)heap_caps_calloc(
+        RECEIVER_BUFFER_SIZE, sizeof(pulse_data_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  if (_pulseTrains2 == NULL) {
+    // Leave the channel disabled: receiverGpio2 stays -1, so neither
+    // enableReceiver() nor the receiver task ever touches it.
+    initializationError = rtl_433_ESPError::OutOfMemory;
+    logprintfLn(LOG_ERR,
+                STR_MODULE
+                " channel 2 disabled: no memory for pulse-train "
+                "buffers");
+    return false;
+  }
+
+  receiverGpio2 = digitalPinToInterrupt(inputPin);
+  _freq2Mhz = receiveFrequency;
+
+  for (unsigned int i = 0; i < RECEIVER_BUFFER_SIZE; i++) {
+    _pulseTrains2[i].num_pulses = 0;
+  }
+  _avaiablePulseTrain2 = 0;
+  _actualPulseTrain2 = 0;
+  _nrpulses2 = 0;
+  receiveMode2 = false;
+#  if PRETRIGGER_ENABLED
+  _pretriggerHead2 = 0;
+  _pretriggerCount2 = 0;
+  _pretriggerPendingPulse2 = 0;
+#  endif
+
+#  ifdef DEMOD_DEBUG
+  logprintfLn(LOG_INFO, STR_MODULE " channel 2 gpio receive pin: %d", inputPin);
+  logprintfLn(LOG_INFO, STR_MODULE " channel 2 receive frequency: %f",
+              receiveFrequency);
+#  endif
+
+  spiTake(portMAX_DELAY);
+  // RADIOLIB_STATE reports failures through rtl_433_radio_config_failed;
+  // borrow the flag for this channel's configuration and put the primary's
+  // verdict back afterwards, so a channel-2 failure disables channel 2
+  // without rewriting history for begin().
+  bool priorRadioFailure = rtl_433_radio_config_failed;
+  rtl_433_radio_config_failed = false;
+
+  int state = radio2.begin();
+  RADIOLIB_STATE(state, "radio2.begin()");
+
+  state = radio2.setFrequency(receiveFrequency);
+  RADIOLIB_STATE(state, "radio2 setFrequency");
+
+  state = radio2.setOOK(true);
+  RADIOLIB_STATE(state, "radio2 setOOK");
+
+  state = radio2.setCrcFiltering(false);
+  RADIOLIB_STATE(state, "radio2 setCrcFiltering");
+
+  // Same asynchronous-OOK modem setup as the primary channel.
+  radio2.SPIsendCommand(RADIOLIB_CC1101_CMD_IDLE);
+
+  state = radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_PKTLEN, 0);
+  RADIOLIB_STATE(state, "radio2 set PKTLEN");
+
+  state = radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL2, CC1101_AGCCTRL2);
+  RADIOLIB_STATE(state, "radio2 set AGCCTRL2");
+
+  state = radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL1, CC1101_AGCCTRL1);
+  RADIOLIB_STATE(state, "radio2 set AGCCTRL1");
+
+  state = radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_AGCCTRL0, CC1101_AGCCTRL0);
+  RADIOLIB_STATE(state, "radio2 set AGCCTRL0");
+
+  state = radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_MDMCFG3, 0x93); // Data rate
+  RADIOLIB_STATE(state, "radio2 set MDMCFG3");
+
+  // Same tuning profile as the primary: RadioLib updates only
+  // MDMCFG4.CHANBW_E/CHANBW_M and preserves the data rate exponent.
+  state = radio2.setRxBandwidth(CC1101_RX_BANDWIDTH);
+  RADIOLIB_STATE(state, "radio2 setRxBandwidth");
+
+  state = radio2.disableSyncWordFiltering(false);
+  RADIOLIB_STATE(state, "radio2 disableSyncWordFiltering");
+
+  state = radio2.receiveDirectAsync();
+  RADIOLIB_STATE(state, "radio2 receiveDirect");
+
+  // RadioLib routes async serial data to GDO0 only; mirror it onto GDO2 so
+  // the board can listen on whichever line RF_MODULE2_RECEIVER_GPIO names.
+  state = radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2, 0x0D);
+  RADIOLIB_STATE(state, "radio2 IOCFG2 serial data out (GDO2)");
+#  if RF_MODULE2_RECEIVER_GPIO != RF_MODULE2_GDO0
+  // Data is consumed on GDO2, so park GDO0 in high impedance (IOCFG 0x2E).
+  // This is not just tidiness: with the demodulator's slicer idling high, a
+  // GDO0 that lands on an ESP32 strap pin (GPIO2, on some boards) holds the
+  // strap high through a reset and blocks serial download mode — the radio
+  // keeps driving the pin because esptool's reset pulse never resets it.
+  radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG0, 0x2E);
+#  endif
+  spiGive();
+
+  bool radioFailed = rtl_433_radio_config_failed;
+  rtl_433_radio_config_failed = priorRadioFailure || radioFailed;
+  if (radioFailed) {
+    initializationError = rtl_433_ESPError::RadioInitialization;
+    receiverGpio2 = -1;
+    logprintfLn(LOG_ERR,
+                STR_MODULE " channel 2 disabled: radio configuration failed");
+    return false;
+  }
+
+  logprintfLn(LOG_NOTICE,
+              STR_MODULE " channel 2 receiving on GPIO %d at %.2f MHz",
+              inputPin, receiveFrequency);
+  return true;
+}
+
+/**
+ * @brief Retune the second receive channel. Safe while receiving: capture is
+ * paused for the duration and any in-progress train is discarded.
+ */
+void rtl_433_ESP::setSecondaryFrequency(float receiveFrequency) {
+  if (receiverGpio2 < 0) {
+    logprintfLn(LOG_ERR,
+                STR_MODULE " channel 2 not initialised, cannot retune");
+    return;
+  }
+
+  // Pause channel-2 capture entirely before touching the radio or the
+  // capture state: detach the edge ISR, clear the flag the receiver task
+  // keys on, and give the task time to observe it — the same handshake the
+  // transmit handover uses for the primary channel. Without this the task
+  // can be inside the channel-2 gating block while the state below changes,
+  // and a train captured at the old frequency could be stamped with the new
+  // one.
+  bool wasEnabled = _enabledReceiver2;
+  if (wasEnabled) {
+    _enabledReceiver2 = false;
+    detachInterrupt((uint8_t)receiverGpio2);
+    delay(5); // let rtl_433_ReceiverTask observe the flag
+  }
+
+  spiTake(portMAX_DELAY);
+  radio2.standby();
+  int state = radio2.setFrequency(receiveFrequency);
+  RADIOLIB_STATE(state, "radio2 setFrequency");
+  radio2.receiveDirectAsync();
+  // directMode() rewrites IOCFG0 only; the GDO2 mirror must be re-applied on
+  // every re-entry to direct mode or the data line goes silently dead.
+  radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG2, 0x0D);
+#  if RF_MODULE2_RECEIVER_GPIO != RF_MODULE2_GDO0
+  // Re-park GDO0 in high impedance (see initSecondaryReceiver — a strap-pin
+  // GDO0 held high by slicer noise blocks serial download mode).
+  radio2.SPIsetRegValue(RADIOLIB_CC1101_REG_IOCFG0, 0x2E);
+#  endif
+  spiGive();
+
+  // Discard the in-progress capture, if any; already-completed trains carry
+  // their own frequency stamp and may drain through the decoder normally.
+  _freq2Mhz = receiveFrequency;
+  receiveMode2 = false;
+  _nrpulses2 = 0;
+#  if PRETRIGGER_ENABLED
+  _pretriggerCount2 = 0;
+  _pretriggerPendingPulse2 = 0;
+#  endif
+
+  if (wasEnabled) {
+    pinMode(receiverGpio2, INPUT);
+    attachInterrupt((uint8_t)receiverGpio2, interruptHandler2, CHANGE);
+    _enabledReceiver2 = true;
+  }
+  logprintfLn(LOG_NOTICE, STR_MODULE " channel 2 retuned to %.2f MHz",
+              receiveFrequency);
+}
+#endif
 
 /**
  * @brief Is a signal available for decoding ?
  * 
  * @return int - which pulse train
  */
-int rtl_433_ESP::receivePulseTrain() {
-  if (_pulseTrains[_avaiablePulseTrain].num_pulses > 0) {
-    uint8_t _currentTrain = _avaiablePulseTrain;
-    _avaiablePulseTrain = (_avaiablePulseTrain + 1) % RECEIVER_BUFFER_SIZE;
-    return _currentTrain;
+bool rtl_433_ESP::receivePulseTrain(pulse_data_t* destination) {
+  if (!destination || !_pulseTrains) {
+    return false;
   }
-  return -1;
+  bool available = false;
+  portENTER_CRITICAL(&captureMux);
+  if (_pulseTrains[_avaiablePulseTrain].num_pulses > 0) {
+    uint8_t currentTrain = _avaiablePulseTrain;
+    memcpy(destination, &_pulseTrains[currentTrain], sizeof(pulse_data_t));
+    memset(&_pulseTrains[currentTrain], 0, sizeof(pulse_data_t));
+    _avaiablePulseTrain = (_avaiablePulseTrain + 1) % RECEIVER_BUFFER_SIZE;
+    available = true;
+  }
+  portEXIT_CRITICAL(&captureMux);
+  return available;
 }
 
 /**
@@ -351,19 +723,56 @@ int rtl_433_ESP::receivePulseTrain() {
  * 
  */
 void ICACHE_RAM_ATTR rtl_433_ESP::interruptHandler() {
-  if (!_enabledReceiver || !receiveMode) {
+  if (!_enabledReceiver) {
     _noiseCount++;
     return;
   }
+
+  const unsigned long now = micros();
+  const unsigned int duration = now - _lastChange;
+
+  if (!receiveMode) {
+#if PRETRIGGER_ENABLED
+    bool level = digitalRead(receiverGpio);
+
+    // A long interval separates unrelated activity; do not carry stale noise
+    // into the next signal's pre-trigger history.
+    if (_lastChange == 0 || duration > PRETRIGGER_WINDOW_US) {
+      _pretriggerCount = 0;
+      _pretriggerPendingPulse = 0;
+    }
+
+    if (!level) {
+      // Falling edge: the preceding high interval is a pulse.
+      _pretriggerPendingPulse =
+          duration > MINIMUM_PULSE_LENGTH && duration <= PRETRIGGER_WINDOW_US
+              ? duration
+              : 0;
+    } else if (_pretriggerPendingPulse > 0 &&
+               duration > MINIMUM_PULSE_LENGTH &&
+               duration <= PRETRIGGER_WINDOW_US) {
+      // Rising edge: complete and retain the pulse/gap pair.
+      _pretriggerPulse[_pretriggerHead] = _pretriggerPendingPulse;
+      _pretriggerGap[_pretriggerHead] = duration;
+      _pretriggerHead = (_pretriggerHead + 1) % PRETRIGGER_PAIRS;
+      if (_pretriggerCount < PRETRIGGER_PAIRS) {
+        _pretriggerCount++;
+      }
+      _pretriggerPendingPulse = 0;
+    }
+
+    _lastChange = now;
+#endif
+    _noiseCount++;
+    return;
+  }
+
   volatile pulse_data_t& pulseTrain = _pulseTrains[_actualPulseTrain];
   volatile int* pulse = pulseTrain.pulse;
   volatile int* gap = pulseTrain.gap;
 #ifdef SIGNAL_RSSI
   volatile int* rssi = pulseTrain.rssi;
 #endif
-
-  const unsigned long now = micros();
-  const unsigned int duration = now - _lastChange;
 
   /* We first do some filtering (same as pilight BPF) */
 
@@ -400,17 +809,131 @@ void ICACHE_RAM_ATTR rtl_433_ESP::interruptHandler() {
   }
 }
 
+#ifdef RF_DUAL_CC1101
+/**
+ * @brief Second channel's pulse receiver logic — the primary handler with the
+ * channel-2 state substituted.
+ */
+void ICACHE_RAM_ATTR rtl_433_ESP::interruptHandler2() {
+  if (!_enabledReceiver2) {
+    _noiseCount2++;
+    return;
+  }
+
+  const unsigned long now = micros();
+  const unsigned int duration = now - _lastChange2;
+
+  if (!receiveMode2) {
+#  if PRETRIGGER_ENABLED
+    bool level = digitalRead(receiverGpio2);
+
+    if (_lastChange2 == 0 || duration > PRETRIGGER_WINDOW_US) {
+      _pretriggerCount2 = 0;
+      _pretriggerPendingPulse2 = 0;
+    }
+
+    if (!level) {
+      _pretriggerPendingPulse2 =
+          duration > MINIMUM_PULSE_LENGTH && duration <= PRETRIGGER_WINDOW_US
+              ? duration
+              : 0;
+    } else if (_pretriggerPendingPulse2 > 0 &&
+               duration > MINIMUM_PULSE_LENGTH &&
+               duration <= PRETRIGGER_WINDOW_US) {
+      _pretriggerPulse2[_pretriggerHead2] = _pretriggerPendingPulse2;
+      _pretriggerGap2[_pretriggerHead2] = duration;
+      _pretriggerHead2 = (_pretriggerHead2 + 1) % PRETRIGGER_PAIRS;
+      if (_pretriggerCount2 < PRETRIGGER_PAIRS) {
+        _pretriggerCount2++;
+      }
+      _pretriggerPendingPulse2 = 0;
+    }
+
+    _lastChange2 = now;
+#  endif
+    _noiseCount2++;
+    return;
+  }
+
+  volatile pulse_data_t& pulseTrain = _pulseTrains2[_actualPulseTrain2];
+  volatile int* pulse = pulseTrain.pulse;
+  volatile int* gap = pulseTrain.gap;
+#  ifdef SIGNAL_RSSI
+  volatile int* rssi = pulseTrain.rssi;
+#  endif
+
+  if (duration > MINIMUM_PULSE_LENGTH && currentRssi2 > rssiThreshold2) {
+#  ifdef SIGNAL_RSSI
+    rssi[_nrpulses2] = currentRssi2;
+#  endif
+    if (!digitalRead(receiverGpio2)) {
+      pulse[_nrpulses2] = duration;
+    } else {
+      if (pulse[_nrpulses2] > 0) {
+        gap[_nrpulses2] = duration;
+        _nrpulses2 = (uint16_t)((_nrpulses2 + 1) % PD_MAX_PULSES);
+      } else if (_nrpulses2 > 1) {
+        gap[_nrpulses2 - 1] += duration;
+      } else {
+        gap[_nrpulses2] = duration;
+        _nrpulses2 = (uint16_t)((_nrpulses2 + 1) % PD_MAX_PULSES);
+      }
+    }
+    _lastChange2 = now;
+  }
+}
+
+/**
+ * @brief Copy out the next completed channel-2 pulse train, if any — the
+ * channel-2 counterpart of receivePulseTrain(), sharing captureMux with it.
+ */
+static bool receivePulseTrain2(pulse_data_t* destination) {
+  if (!destination || !_pulseTrains2) {
+    return false;
+  }
+  bool available = false;
+  portENTER_CRITICAL(&captureMux);
+  if (_pulseTrains2[_avaiablePulseTrain2].num_pulses > 0) {
+    uint8_t currentTrain = _avaiablePulseTrain2;
+    memcpy(destination, &_pulseTrains2[currentTrain], sizeof(pulse_data_t));
+    memset(&_pulseTrains2[currentTrain], 0, sizeof(pulse_data_t));
+    _avaiablePulseTrain2 = (_avaiablePulseTrain2 + 1) % RECEIVER_BUFFER_SIZE;
+    available = true;
+  }
+  portEXIT_CRITICAL(&captureMux);
+  return available;
+}
+#endif
+
 /**
  * @brief Reset received signal storage
- * 
+ *
  */
 void rtl_433_ESP::resetReceiver() {
+  if (!_pulseTrains) {
+    return;
+  }
+  portENTER_CRITICAL(&captureMux);
   for (unsigned int i = 0; i < RECEIVER_BUFFER_SIZE; i++) {
     _pulseTrains[i].num_pulses = 0;
   }
   _avaiablePulseTrain = 0;
   _actualPulseTrain = 0;
   _nrpulses = 0;
+  portEXIT_CRITICAL(&captureMux);
+#if PRETRIGGER_ENABLED
+  _pretriggerHead = 0;
+  _pretriggerCount = 0;
+  _pretriggerPendingPulse = 0;
+#endif
+
+#ifdef AUTORSSITHRESHOLD
+  _rssiCalibrated = false;
+#endif
+  _totalRssi = 0;
+  _rssiCount = 0;
+  _peakRssi = -256;
+  _aboveThreshold = 0;
 
   receiveMode = false;
   signalStart = micros();
@@ -427,16 +950,105 @@ void rtl_433_ESP::enableReceiver() {
     attachInterrupt((uint8_t)receiverGpio, interruptHandler, CHANGE);
     _enabledReceiver = true;
   }
+#ifdef RF_DUAL_CC1101
+  if (receiverGpio2 >= 0) {
+    pinMode(receiverGpio2, INPUT);
+    attachInterrupt((uint8_t)receiverGpio2, interruptHandler2, CHANGE);
+    _enabledReceiver2 = true;
+  }
+#endif
 }
 
 /**
  * @brief Disable receiver logic, and pulse receiver
- * 
+ *
  */
 void rtl_433_ESP::disableReceiver() {
   _enabledReceiver = false;
-  detachInterrupt((uint8_t)receiverGpio);
+  if (receiverGpio >= 0) {
+    detachInterrupt((uint8_t)receiverGpio);
+  }
+#ifdef RF_DUAL_CC1101
+  if (receiverGpio2 >= 0) {
+    _enabledReceiver2 = false;
+    detachInterrupt((uint8_t)receiverGpio2);
+  }
+#endif
 }
+
+void rtl_433_ESP::end() {
+  disableReceiver();
+  if (rtl_433_ReceiverHandle) {
+    // The receiver task takes the SPI lock around its RSSI reads; deleting
+    // it mid-read would leave the lock held forever and hang the next
+    // blocking SPI operation after a later begin(). Holding the lock across
+    // the deletion means it can only land while the task is outside any
+    // locked section — a task blocked WAITING on the lock is removed from
+    // the semaphore's wait list safely by vTaskDelete.
+    spiTake(portMAX_DELAY);
+    vTaskDelete(rtl_433_ReceiverHandle);
+    rtl_433_ReceiverHandle = nullptr;
+    spiGive();
+  }
+  rtlShutdown();
+  if (_pulseTrains) {
+    free(_pulseTrains);
+    _pulseTrains = nullptr;
+  }
+#ifdef RF_DUAL_CC1101
+  if (_pulseTrains2) {
+    free(_pulseTrains2);
+    _pulseTrains2 = NULL;
+  }
+  receiverGpio2 = -1;
+#endif
+  initialized = false;
+  receiverGpio = -1;
+}
+
+bool rtl_433_ESP::isInitialized() { return initialized; }
+
+rtl_433_ESPError rtl_433_ESP::lastError() { return initializationError; }
+
+rtl_433_ESPStatus rtl_433_ESP::statusSnapshot() {
+  rtl_433_ESPStatus snapshot{};
+  portENTER_CRITICAL(&captureMux);
+  snapshot.capturedSignals = totalSignals;
+  snapshot.decodedSignals = decoderSignals;
+  snapshot.decodedMessages = decodedMessages;
+  snapshot.zeroDecodedSignals = zeroDecodedSignals;
+  snapshot.droppedCaptureBuffers = droppedCaptureBuffers;
+  snapshot.droppedDecoderQueue = droppedDecoderQueue;
+  snapshot.currentRssi = currentRssi;
+  snapshot.averageRssi = averageRssi;
+  snapshot.rssiThreshold = rssiThreshold;
+  snapshot.receiverEnabled = _enabledReceiver;
+  portEXIT_CRITICAL(&captureMux);
+  return snapshot;
+}
+
+#ifdef RF_DUAL_CC1101
+/**
+ * @brief Stop only the primary channel's capture for a transmit handover,
+ * leaving the second channel listening. The receiver task keys each channel
+ * on its own enable flag, so channel 2's RSSI polling and gating continue;
+ * the caller's own radio-register work must run under spiTake()/spiGive().
+ */
+void rtl_433_ESP::suspendPrimaryForTx() {
+  _enabledReceiver = false;
+  if (receiverGpio >= 0) {
+    detachInterrupt((uint8_t)receiverGpio);
+  }
+}
+
+void rtl_433_ESP::resumePrimaryFromTx() {
+  if (receiverGpio >= 0) {
+    pinMode(receiverGpio, INPUT);
+    attachInterrupt((uint8_t)receiverGpio, interruptHandler, CHANGE);
+    _enabledReceiver = true;
+  }
+}
+#endif
 
 /**
  * @brief watch for completed signals being received, and pass to decoder logic
@@ -449,28 +1061,37 @@ void rtl_433_ESP::loop() {
     if (millis() - _deafWorkaround > 3600000) // restart receiver every hour
     {
       _deafWorkaround = millis();
-      // radio.SetRx(); // set Receive on
-      radio.SPIsendCommand(RADIOLIB_CC1101_CMD_IDLE); // set Receive on
-      radio.SPIsendCommand(RADIOLIB_CC1101_CMD_RX); // set Receive on
-
+      // This runs in the caller's context while the receiver task polls RSSI
+      // on its own core; the strobes must not interleave with those reads.
+      if (spiTake(100)) {
+        // radio.SetRx(); // set Receive on
+        radio.SPIsendCommand(RADIOLIB_CC1101_CMD_IDLE); // set Receive on
+        radio.SPIsendCommand(RADIOLIB_CC1101_CMD_RX); // set Receive on
+#  ifdef RF_DUAL_CC1101
+        if (_enabledReceiver2) {
+          radio2.SPIsendCommand(RADIOLIB_CC1101_CMD_IDLE);
+          radio2.SPIsendCommand(RADIOLIB_CC1101_CMD_RX);
+        }
+#  endif
+        spiGive();
+      }
     } // workaround for a deaf CC1101
 #endif
 
-    int _receiveTrain = receivePulseTrain();
-    if (_receiveTrain != -1) // Is there anything to receive ?
-    {
+    if (_pulseTrains &&
+        _pulseTrains[_avaiablePulseTrain].num_pulses > 0) {
 #ifdef MEMORY_DEBUG
       logprintfLn(LOG_INFO, "Pre copy out of train: %d", ESP.getFreeHeap());
 #endif
-      pulse_data_t* rtl_pulses = (pulse_data_t*)heap_caps_calloc(1, sizeof(pulse_data_t), MALLOC_CAP_INTERNAL);
-      memcpy(rtl_pulses, (char*)&_pulseTrains[_receiveTrain], sizeof(pulse_data_t));
-      _pulseTrains[_receiveTrain].num_pulses = 0; // Make pulse train available for next train
-      for (int x = 0; x < PD_MAX_PULSES; x++) {
-        _pulseTrains[_receiveTrain].pulse[x] = 0;
-        _pulseTrains[_receiveTrain].gap[x] = 0;
-#ifdef SIGNAL_RSSI
-        _pulseTrains[_receiveTrain].rssi[x] = 0;
-#endif
+      pulse_data_t* rtl_pulses = (pulse_data_t*)heap_caps_calloc(1, sizeof(pulse_data_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      if (!rtl_pulses) {
+        initializationError = rtl_433_ESPError::OutOfMemory;
+        droppedDecoderQueue++;
+        return;
+      }
+      if (!receivePulseTrain(rtl_pulses)) {
+        free(rtl_pulses);
+        return;
       }
 #ifdef MEMORY_DEBUG
       logprintfLn(LOG_INFO, "Post copy out of train: %d", ESP.getFreeHeap());
@@ -517,13 +1138,38 @@ void rtl_433_ESP::loop() {
       }
 #  endif
 #endif
-      signalRatio = (totalSignals - (ignoredSignals + unparsedSignals)) / totalSignals * 100;
+      signalRatio = totalSignals
+                        ? (100 * (totalSignals - (ignoredSignals + unparsedSignals))) / totalSignals
+                        : 0;
 
       totalSignals = 0;
       ignoredSignals = 0;
       unparsedSignals = 0;
     }
   }
+
+#ifdef RF_DUAL_CC1101
+  // Channel 2 pickup. Deliberately outside the primary-enabled gate: the
+  // second channel keeps receiving while the primary is suspended for a
+  // transmit handover. totalSignals/ignoredSignals/unparsedSignals remain
+  // whole-device aggregates; messageCount2 is the per-channel counter.
+  if (_enabledReceiver2 && _pulseTrains2 &&
+      _pulseTrains2[_avaiablePulseTrain2].num_pulses > 0) {
+    pulse_data_t* rtl_pulses = (pulse_data_t*)heap_caps_calloc(
+        1, sizeof(pulse_data_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!rtl_pulses) {
+      initializationError = rtl_433_ESPError::OutOfMemory;
+      droppedDecoderQueue++;
+    } else if (!receivePulseTrain2(rtl_pulses)) {
+      free(rtl_pulses);
+    } else if (rtl_pulses->num_pulses > PD_MIN_PULSES) {
+      processSignal(rtl_pulses);
+    } else {
+      ignoredSignals++;
+      free(rtl_pulses);
+    }
+  }
+#endif
   vTaskDelay(1);
 }
 
@@ -537,25 +1183,57 @@ void rtl_433_ESP::rtl_433_ReceiverTask(void* pvParameters) {
     if (_enabledReceiver) {
       // Calculate average RSSI signal level in environment
 
+      spiTake(portMAX_DELAY);
       currentRssi = _getRSSI();
+      spiGive();
       _rssiCount++;
       _totalRssi += currentRssi;
+      if (currentRssi > _peakRssi)
+        _peakRssi = currentRssi;
+      if (currentRssi > rssiThreshold)
+        _aboveThreshold++;
 
-      if (_rssiCount > RSSI_SAMPLES) // Adjust RSSI Signal Threshold
+#ifdef AUTORSSITHRESHOLD
+      int rssiSamples = _rssiCalibrated ? RSSI_SAMPLES : RSSI_INITIAL_SAMPLES;
+#else
+      int rssiSamples = RSSI_SAMPLES;
+#endif
+
+      if (_rssiCount >= rssiSamples) // Adjust RSSI Signal Threshold
       {
         averageRssi = _totalRssi / _rssiCount;
 
 #ifdef AUTORSSITHRESHOLD
         rssiThreshold = averageRssi + rssiThresholdDelta;
-        logprintfLn(LOG_DEBUG,
-                    "Average RSSI Signal %d dbm, adjusted RSSI Threshold %d, "
-                    "samples %d",
-                    averageRssi, rssiThreshold, RSSI_SAMPLES);
+        if (!_rssiCalibrated) {
+          _rssiCalibrated = true;
+          logprintfLn(LOG_NOTICE,
+                      "Initial RSSI calibration complete: average %d dbm, "
+                      "threshold %d dbm, samples %d, peak %d dbm, "
+                      "above-threshold %d; reception enabled",
+                      averageRssi, rssiThreshold, rssiSamples, _peakRssi,
+                      _aboveThreshold);
+        } else {
+          logprintfLn(LOG_DEBUG,
+                      "Average RSSI Signal %d dbm, adjusted RSSI Threshold %d, "
+                      "samples %d, peak %d dbm, above-threshold %d",
+                      averageRssi, rssiThreshold, rssiSamples, _peakRssi,
+                      _aboveThreshold);
+        }
 #endif
 
+        _peakRssi = -256;
+        _aboveThreshold = 0;
         _totalRssi = 0;
         _rssiCount = 0;
       }
+
+#ifdef AUTORSSITHRESHOLD
+      if (!_rssiCalibrated) {
+        vTaskDelay(1);
+        continue;
+      }
+#endif
 
       if (currentRssi > rssiThreshold) // A signal is present
       {
@@ -566,7 +1244,60 @@ void rtl_433_ESP::rtl_433_ReceiverTask(void* pvParameters) {
           digitalWrite(ONBOARD_LED, HIGH);
 #endif
           signalRssi = currentRssi;
-          _lastChange = micros();
+
+#if PRETRIGGER_ENABLED
+          // Snapshot the recent idle edge history while interrupts are
+          // stopped, then prepend the newest portion that fits in the bounded
+          // pre-trigger window. The ISR resumes into the same active train.
+          noInterrupts();
+          uint8_t selected = 0;
+          unsigned int pretriggerDuration = 0;
+          for (uint8_t i = 0; i < _pretriggerCount; ++i) {
+            uint8_t index =
+                (_pretriggerHead + PRETRIGGER_PAIRS - 1 - i) %
+                PRETRIGGER_PAIRS;
+            unsigned int pairDuration =
+                _pretriggerPulse[index] + _pretriggerGap[index];
+            if (pretriggerDuration + pairDuration > PRETRIGGER_WINDOW_US) {
+              break;
+            }
+            pretriggerDuration += pairDuration;
+            selected++;
+          }
+
+          uint8_t first =
+              (_pretriggerHead + PRETRIGGER_PAIRS - selected) %
+              PRETRIGGER_PAIRS;
+          for (uint8_t i = 0; i < selected; ++i) {
+            uint8_t index = (first + i) % PRETRIGGER_PAIRS;
+            _pulseTrains[_actualPulseTrain].pulse[i] =
+                _pretriggerPulse[index];
+            _pulseTrains[_actualPulseTrain].gap[i] = _pretriggerGap[index];
+#  ifdef SIGNAL_RSSI
+            _pulseTrains[_actualPulseTrain].rssi[i] = currentRssi;
+#  endif
+          }
+          _nrpulses = selected;
+
+          // If capture starts during a low interval, retain the high pulse
+          // which ended on the preceding falling edge. Its gap will be
+          // completed by the next ISR invocation.
+          if (!digitalRead(receiverGpio) &&
+              _pretriggerPendingPulse > 0 &&
+              _nrpulses < PD_MAX_PULSES) {
+            _pulseTrains[_actualPulseTrain].pulse[_nrpulses] =
+                _pretriggerPendingPulse;
+            pretriggerDuration += _pretriggerPendingPulse;
+          }
+
+          _pretriggerCount = 0;
+          _pretriggerPendingPulse = 0;
+          interrupts();
+
+          signalStart -= pretriggerDuration;
+#else
+          _lastChange = signalStart;
+#endif
 
           if (_noiseCount > 100) {
 #ifdef AUTOOOKFIX
@@ -609,27 +1340,53 @@ void rtl_433_ESP::rtl_433_ReceiverTask(void* pvParameters) {
 #endif
           receiveMode = false;
           totalSignals++;
-          if ((_nrpulses > PD_MIN_PULSES) &&
-              ((signalEnd - signalStart) >
-               MINIMUM_SIGNAL_LENGTH)) // Minimum signal length of MINIMUM_SIGNAL_LENGTH MS
-          {
+          if (rtl_433_capture::isCompleteSignal(
+                  _nrpulses, signalEnd - signalStart, PD_MIN_PULSES,
+                  MINIMUM_SIGNAL_LENGTH)) {
+            uint8_t nextTrain = (_actualPulseTrain + 1) % RECEIVER_BUFFER_SIZE;
+            portENTER_CRITICAL(&captureMux);
+            if (!rtl_433_capture::canPublishToNextBuffer(
+                    _pulseTrains[nextTrain].num_pulses)) {
+              memset(&_pulseTrains[_actualPulseTrain], 0, sizeof(pulse_data_t));
+              droppedCaptureBuffers++;
+              portEXIT_CRITICAL(&captureMux);
+              _nrpulses = 0;
+              continue;
+            }
+            // Record the real trailing silence as the final gap (as upstream
+            // rtl_433 does). The ISR only sets gap[n] on the next rising edge, so
+            // the last gap was left 0/stale and PCM/RZ decoders lost trailing
+            // zero bits (e.g. DSC-Security frames ending in 0 came out short).
+            _pulseTrains[_actualPulseTrain].gap[_nrpulses] =
+                (int)(micros() - _lastChange);
             _pulseTrains[_actualPulseTrain].num_pulses = _nrpulses + 1;
             _pulseTrains[_actualPulseTrain].signalDuration =
                 signalEnd - signalStart;
             _pulseTrains[_actualPulseTrain].signalRssi = signalRssi;
+            _pulseTrains[_actualPulseTrain].centerfreq_hz =
+                receiveFrequencyMhz * 1.0e6f;
 #ifdef DEMOD_DEBUG
-            logprintf(LOG_INFO, "Signal length: %lu",
-                      _pulseTrains[_actualPulseTrain].signalDuration);
-            alogprintf(LOG_INFO, ", Gap length: %lu", signalStart - gapStart);
-            alogprintf(LOG_INFO, ", Signal RSSI: %d",
-                       _pulseTrains[_actualPulseTrain].signalRssi);
-            alogprintf(LOG_INFO, ", train: %d", _actualPulseTrain);
-            alogprintf(LOG_INFO, ", messageCount: %d", messageCount);
-            alogprintfLn(LOG_INFO, ", pulses: %d", _nrpulses);
+            // Snapshot inside the lock; print after portEXIT_CRITICAL.
+            // printf under a spinlock aborts in newlib lock_acquire_generic().
+            unsigned long dbgLen = _pulseTrains[_actualPulseTrain].signalDuration;
+            unsigned long dbgGap = elapsedMicrosOrZero(signalStart, gapStart);
+            int dbgRssi = _pulseTrains[_actualPulseTrain].signalRssi;
+            int dbgTrain = _actualPulseTrain;
+            int dbgCount = messageCount;
+            int dbgPulses = _nrpulses;
 #endif
             messageCount++;
             gapStart = micros();
-            _actualPulseTrain = (_actualPulseTrain + 1) % RECEIVER_BUFFER_SIZE;
+            _actualPulseTrain = nextTrain;
+            portEXIT_CRITICAL(&captureMux);
+#ifdef DEMOD_DEBUG
+            logprintf(LOG_INFO, "Signal length: %lu", dbgLen);
+            alogprintf(LOG_INFO, ", Gap length: %lu", dbgGap);
+            alogprintf(LOG_INFO, ", Signal RSSI: %d", dbgRssi);
+            alogprintf(LOG_INFO, ", train: %d", dbgTrain);
+            alogprintf(LOG_INFO, ", messageCount: %d", dbgCount);
+            alogprintfLn(LOG_INFO, ", pulses: %d", dbgPulses);
+#endif
             _nrpulses = 0;
           } else {
             ignoredSignals++;
@@ -640,7 +1397,8 @@ void rtl_433_ESP::rtl_433_ReceiverTask(void* pvParameters) {
 
               alogprintf(LOG_INFO, ", Time since last bit length: %lu",
                          micros() - signalEnd);
-              alogprintf(LOG_INFO, ", Gap length: %lu", signalStart - gapStart);
+              alogprintf(LOG_INFO, ", Gap length: %lu",
+                         elapsedMicrosOrZero(signalStart, gapStart));
               alogprintf(LOG_INFO, ", Signal RSSI: %d", signalRssi);
               alogprintf(LOG_INFO, ", Current RSSI: %d", currentRssi);
               alogprintf(LOG_INFO, ", pulses: %d", _nrpulses);
@@ -657,6 +1415,168 @@ void rtl_433_ESP::rtl_433_ReceiverTask(void* pvParameters) {
         }
       }
     }
+
+#ifdef RF_DUAL_CC1101
+    // Channel 2: the same RSSI-gated capture logic against the second radio.
+    // Interleaved in this task on purpose — one context owns all RSSI polling,
+    // so the two radios' SPI transfers can never interleave with each other.
+    if (_enabledReceiver2) {
+      spiTake(portMAX_DELAY);
+      currentRssi2 = radio2.getRSSI();
+      spiGive();
+      _rssiCount2++;
+      _totalRssi2 += currentRssi2;
+      if (currentRssi2 > _peakRssi2)
+        _peakRssi2 = currentRssi2;
+      if (currentRssi2 > rssiThreshold2)
+        _aboveThreshold2++;
+
+#  ifdef AUTORSSITHRESHOLD
+      int rssiSamples2 = _rssiCalibrated2 ? RSSI_SAMPLES : RSSI_INITIAL_SAMPLES;
+#  else
+      int rssiSamples2 = RSSI_SAMPLES;
+#  endif
+
+      if (_rssiCount2 >= rssiSamples2) {
+        averageRssi2 = _totalRssi2 / _rssiCount2;
+#  ifdef AUTORSSITHRESHOLD
+        rssiThreshold2 = averageRssi2 + rssiThresholdDelta;
+        if (!_rssiCalibrated2) {
+          _rssiCalibrated2 = true;
+          logprintfLn(LOG_NOTICE,
+                      "Channel 2 initial RSSI calibration complete: average %d "
+                      "dbm, threshold %d dbm, samples %d, peak %d dbm, "
+                      "above-threshold %d; reception enabled",
+                      averageRssi2, rssiThreshold2, rssiSamples2, _peakRssi2,
+                      _aboveThreshold2);
+        } else {
+          logprintfLn(LOG_DEBUG,
+                      "Channel 2 average RSSI Signal %d dbm, adjusted RSSI "
+                      "Threshold %d, samples %d, peak %d dbm, "
+                      "above-threshold %d",
+                      averageRssi2, rssiThreshold2, rssiSamples2, _peakRssi2,
+                      _aboveThreshold2);
+        }
+#  endif
+        _peakRssi2 = -256;
+        _aboveThreshold2 = 0;
+        _totalRssi2 = 0;
+        _rssiCount2 = 0;
+      }
+
+#  ifdef AUTORSSITHRESHOLD
+      if (!_rssiCalibrated2) {
+        vTaskDelay(1);
+        continue;
+      }
+#  endif
+
+      if (currentRssi2 > rssiThreshold2) // A signal is present
+      {
+        if (!receiveMode2) {
+          receiveMode2 = true;
+          signalStart2 = micros();
+          signalRssi2 = currentRssi2;
+
+#  if PRETRIGGER_ENABLED
+          noInterrupts();
+          uint8_t selected = 0;
+          unsigned int pretriggerDuration = 0;
+          for (uint8_t i = 0; i < _pretriggerCount2; ++i) {
+            uint8_t index =
+                (_pretriggerHead2 + PRETRIGGER_PAIRS - 1 - i) %
+                PRETRIGGER_PAIRS;
+            unsigned int pairDuration =
+                _pretriggerPulse2[index] + _pretriggerGap2[index];
+            if (pretriggerDuration + pairDuration > PRETRIGGER_WINDOW_US) {
+              break;
+            }
+            pretriggerDuration += pairDuration;
+            selected++;
+          }
+
+          uint8_t first =
+              (_pretriggerHead2 + PRETRIGGER_PAIRS - selected) %
+              PRETRIGGER_PAIRS;
+          for (uint8_t i = 0; i < selected; ++i) {
+            uint8_t index = (first + i) % PRETRIGGER_PAIRS;
+            _pulseTrains2[_actualPulseTrain2].pulse[i] =
+                _pretriggerPulse2[index];
+            _pulseTrains2[_actualPulseTrain2].gap[i] = _pretriggerGap2[index];
+#    ifdef SIGNAL_RSSI
+            _pulseTrains2[_actualPulseTrain2].rssi[i] = currentRssi2;
+#    endif
+          }
+          _nrpulses2 = selected;
+
+          if (!digitalRead(receiverGpio2) &&
+              _pretriggerPendingPulse2 > 0 &&
+              _nrpulses2 < PD_MAX_PULSES) {
+            _pulseTrains2[_actualPulseTrain2].pulse[_nrpulses2] =
+                _pretriggerPendingPulse2;
+            pretriggerDuration += _pretriggerPendingPulse2;
+          }
+
+          _pretriggerCount2 = 0;
+          _pretriggerPendingPulse2 = 0;
+          interrupts();
+
+          signalStart2 -= pretriggerDuration;
+#  else
+          _lastChange2 = signalStart2;
+#  endif
+
+          if (_noiseCount2 > 100) {
+            _noiseCount2 = 0;
+          }
+        }
+        signalEnd2 = micros();
+      } else if (micros() - signalEnd2 < MINIMUM_SIGNAL_LENGTH &&
+                 micros() - signalStart2 > 30000) {
+        // skip over signal drop outs
+      } else // A signal is not present
+      {
+        if (receiveMode2) // Complete reception of a signal
+        {
+          receiveMode2 = false;
+          totalSignals++;
+          if (rtl_433_capture::isCompleteSignal(
+                  _nrpulses2, signalEnd2 - signalStart2, PD_MIN_PULSES,
+                  MINIMUM_SIGNAL_LENGTH)) {
+            uint8_t nextTrain2 =
+                (_actualPulseTrain2 + 1) % RECEIVER_BUFFER_SIZE;
+            portENTER_CRITICAL(&captureMux);
+            if (!rtl_433_capture::canPublishToNextBuffer(
+                    _pulseTrains2[nextTrain2].num_pulses)) {
+              memset(&_pulseTrains2[_actualPulseTrain2], 0,
+                     sizeof(pulse_data_t));
+              droppedCaptureBuffers++;
+              portEXIT_CRITICAL(&captureMux);
+              _nrpulses2 = 0;
+            } else {
+              // Record the real trailing silence as the final gap (see channel 1).
+              _pulseTrains2[_actualPulseTrain2].gap[_nrpulses2] =
+                  (int)(micros() - _lastChange2);
+              _pulseTrains2[_actualPulseTrain2].num_pulses = _nrpulses2 + 1;
+              _pulseTrains2[_actualPulseTrain2].signalDuration =
+                  signalEnd2 - signalStart2;
+              _pulseTrains2[_actualPulseTrain2].signalRssi = signalRssi2;
+              _pulseTrains2[_actualPulseTrain2].centerfreq_hz =
+                  _freq2Mhz * 1.0e6f;
+              messageCount2++;
+              gapStart2 = micros();
+              _actualPulseTrain2 = nextTrain2;
+              portEXIT_CRITICAL(&captureMux);
+              _nrpulses2 = 0;
+            }
+          } else {
+            ignoredSignals++;
+            _nrpulses2 = 0;
+          }
+        }
+      }
+    }
+#endif
     vTaskDelay(1);
   }
 }
@@ -674,11 +1594,23 @@ int _bufferSize;
 
 void rtl_433_ESP::setCallback(rtl_433_ESPCallBack callback, char* messageBuffer,
                               int bufferSize) {
+  if (!callback || !messageBuffer || bufferSize <= 0) {
+    initializationError = rtl_433_ESPError::InvalidArgument;
+    _callback = nullptr;
+    _messageBuffer = nullptr;
+    _bufferSize = 0;
+    _setCallback(nullptr, nullptr, 0);
+    return;
+  }
   // logprintfLn(LOG_DEBUG, "rtl_433_ESP::setCallback location: %p", callback);
   _callback = callback;
   _messageBuffer = messageBuffer;
   _bufferSize = bufferSize;
   _setCallback(callback, messageBuffer, bufferSize);
+}
+
+void rtl_433_ESP::setRawPulsesCallback(rtl_433_raw_pulse_cb callback) {
+  _setRawPulsesCallback(callback);
 }
 
 /**
@@ -731,7 +1663,7 @@ void rtl_433_ESP::setDebug(int debug) {
 void rtl_433_ESP::getStatus() {
   alogprintfLn(LOG_INFO, " ");
   logprintf(LOG_INFO, "Status Message: Gap length: %lu",
-            signalStart - gapStart);
+            elapsedMicrosOrZero(signalStart, gapStart));
   alogprintf(LOG_INFO, ", Modulation: %s", ookModulation ? "OOK" : "FSK");
   alogprintf(LOG_INFO, ", Signal RSSI: %d", signalRssi);
   alogprintf(LOG_INFO, ", train: %d", _actualPulseTrain);
@@ -740,6 +1672,8 @@ void rtl_433_ESP::getStatus() {
   alogprintf(LOG_INFO, ", signalRatio: %d", signalRatio);
   alogprintf(LOG_INFO, ", ignoredSignals: %d", ignoredSignals);
   alogprintf(LOG_INFO, ", unparsedSignals: %d", unparsedSignals);
+  alogprintf(LOG_INFO, ", droppedCaptureBuffers: %u", droppedCaptureBuffers);
+  alogprintf(LOG_INFO, ", droppedDecoderQueue: %u", droppedDecoderQueue);
   alogprintf(LOG_INFO, ", _enabledReceiver: %d", _enabledReceiver);
   alogprintf(LOG_INFO, ", receiveMode: %d", receiveMode);
   alogprintf(LOG_INFO, ", currentRssi: %d", currentRssi);
@@ -771,6 +1705,8 @@ void rtl_433_ESP::getStatus() {
                 "signalRatio",    "", DATA_INT, signalRatio,
                 "ignoredSignals", "", DATA_INT, ignoredSignals,
                 "unparsedSignals", "", DATA_INT, unparsedSignals,
+                "droppedCaptureBuffers", "", DATA_INT, droppedCaptureBuffers,
+                "droppedDecoderQueue", "", DATA_INT, droppedDecoderQueue,
                 "StackHWM",       "", DATA_INT, uxTaskGetStackHighWaterMark(NULL),
                 "RTL_HWM",        "", DATA_INT, uxTaskGetStackHighWaterMark(rtl_433_ReceiverHandle),
                 "DCD_HWM",        "", DATA_INT, uxTaskGetStackHighWaterMark(rtl_433_DecoderHandle),
@@ -778,12 +1714,27 @@ void rtl_433_ESP::getStatus() {
                 "_enabledReceiver", "", DATA_INT, _enabledReceiver,
                 "receiveMode",    "", DATA_INT, receiveMode,
                 NULL);
+
+#ifdef RF_DUAL_CC1101
+  data_append(data,
+              "RTLCnt2", "", DATA_INT, messageCount2,
+              "RTLRssi2", "", DATA_INT, currentRssi2,
+              "RTLAVGRssi2", "", DATA_INT, averageRssi2,
+              "RTLRssiThresh2", "", DATA_INT, rssiThreshold2,
+              // rounded to 10 kHz so 433.92f doesn't serialise as 433.9199829
+              "mhz2", "", DATA_DOUBLE,
+              (double)((long)(_freq2Mhz * 100.0f + 0.5f)) / 100.0,
+              "_enabledReceiver2", "", DATA_INT, (int)_enabledReceiver2,
+              NULL);
+#endif
 #ifdef RF_MODULE_INIT_STATUS
   getModuleStatus();
 #endif
 
-  data_print_jsons(data, _messageBuffer, _bufferSize);
-  (_callback)(_messageBuffer);
+  if (_callback && _messageBuffer && _bufferSize > 0) {
+    data_print_jsons(data, _messageBuffer, _bufferSize);
+    (_callback)(_messageBuffer);
+  }
   data_free(data);
 }
 
@@ -809,6 +1760,9 @@ int rtl_433_ESP::_getRSSI(void) {
  *
  */
 void rtl_433_ESP::getModuleStatus() {
+  // Register dump runs in the caller's context while the receiver task may be
+  // polling RSSI on its own core; hold the SPI lock for the duration.
+  spiTake(portMAX_DELAY);
 #ifdef RF_CC1101
   alogprintfLn(LOG_INFO, "----- CC1101 Status -----");
   alogprintfLn(LOG_INFO, "CC1101_MDMCFG1: 0x%.2x",
@@ -925,7 +1879,7 @@ void rtl_433_ESP::getModuleStatus() {
   alogprintfLn(LOG_INFO, "RegOpMode: 0x%.2x",
                _mod->SPIreadRegister(RADIOLIB_SX127X_REG_OP_MODE));
   alogprintfLn(LOG_INFO, "RegPacketConfig1: 0x%.2x",
-               _mod->SPIreadRegister(RADIOLIB_SX127X_REG_PACKET_CONFIG_2));
+               _mod->SPIreadRegister(RADIOLIB_SX127X_REG_PACKET_CONFIG_1));
   alogprintfLn(LOG_INFO, "RegPacketConfig2: 0x%.2x",
                _mod->SPIreadRegister(RADIOLIB_SX127X_REG_PACKET_CONFIG_2));
   alogprintfLn(LOG_INFO, "RegBitrateMsb: 0x%.2x",
@@ -966,13 +1920,19 @@ void rtl_433_ESP::getModuleStatus() {
   alogprintfLn(LOG_INFO, "----- SX127x Status -----");
 
 #endif
+  spiGive();
 }
 
 /**
  * Functions used only during testing
  *
  */
-#if defined(setBitrate) || defined(setFreqDev) || defined(setRxBW)
+#if defined(setBitrate) || defined(setFreqDev) || defined(setRxBW) || \
+    defined(CC1101_OOK_TUNING)
+int16_t rtl_433_ESP::setFrequency(float value) {
+  return radio.setFrequency(value);
+}
+
 int16_t rtl_433_ESP::setFrequencyDeviation(float value) {
   return radio.setFrequencyDeviation(value);
 }
@@ -992,4 +1952,15 @@ int16_t rtl_433_ESP::setBitRate(float value) {
 int16_t rtl_433_ESP::setRxBandwidth(float value) {
   return radio.setRxBandwidth(value);
 }
+
+#  if defined(RF_CC1101)
+int16_t rtl_433_ESP::setCC1101Register(uint8_t address, uint8_t value) {
+  radio.SPIsendCommand(RADIOLIB_CC1101_CMD_IDLE);
+  return radio.SPIsetRegValue(address, value);
+}
+
+uint8_t rtl_433_ESP::getCC1101Register(uint8_t address) {
+  return radio.SPIreadRegister(address);
+}
+#  endif
 #endif

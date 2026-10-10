@@ -25,6 +25,8 @@
 #include "r_util.h"
 #include "rtl_433.h"
 #include "rtl_433_devices.h"
+
+extern unsigned long rtl_433_millis(void);
 // #include "pulse_detect_fsk.h"
 // #include "compat_time.h"
 #include "data.h"
@@ -975,7 +977,23 @@ void data_acquired_handler(r_device* r_dev, data_t* data) {
 
   data_append(data, "protocol", "", DATA_STRING, r_dev->name, "rssi", "RSSI",
               DATA_INT, cfg->demod->pulse_data.signalRssi, "duration", "",
-              DATA_INT, cfg->demod->pulse_data.signalDuration, NULL);
+              DATA_INT, cfg->demod->pulse_data.signalDuration, "time_ms", "",
+              DATA_INT, (int)rtl_433_millis(), NULL);
+  // On a multi-radio receiver the capture path stamps each pulse train with
+  // the frequency its radio was tuned to; pass it through so a decode can be
+  // attributed to the channel it arrived on. Zero means "not stamped".
+  // Rounded to 10 kHz: the stamp travels as a single-precision float and
+  // 433.92f would otherwise serialise as 433.9199829.
+  if (cfg->demod->pulse_data.centerfreq_hz > 0) {
+    double mhz =
+        (double)((long)(cfg->demod->pulse_data.centerfreq_hz / 10000.0f + 0.5f)) /
+        100.0;
+    data_append(data, "mhz", "", DATA_DOUBLE, mhz, NULL);
+  }
+  if (!cfg->callback || !cfg->messageBuffer || cfg->bufferSize <= 0) {
+    data_free(data);
+    return;
+  }
   data_print_jsons(data, cfg->messageBuffer, cfg->bufferSize);
 #ifdef DEMOD_DEBUG
   logprintfLn(LOG_INFO, "data_output %s", cfg->messageBuffer);
