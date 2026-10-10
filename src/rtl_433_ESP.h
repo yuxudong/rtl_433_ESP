@@ -89,10 +89,14 @@
 // signals shorter than this are ignored in interrupt handler
 
 #if OOK_MODULATION
-#  define MINIMUM_PULSE_LENGTH  50
+#  ifndef MINIMUM_PULSE_LENGTH
+#    define MINIMUM_PULSE_LENGTH  30
+#  endif
 #  define MINIMUM_SIGNAL_LENGTH 40000
 #else
-#  define MINIMUM_PULSE_LENGTH  30
+#  ifndef MINIMUM_PULSE_LENGTH
+#    define MINIMUM_PULSE_LENGTH  30
+#  endif
 #  define MINIMUM_SIGNAL_LENGTH 500
 #endif
 
