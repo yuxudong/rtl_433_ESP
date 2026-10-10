@@ -239,7 +239,7 @@ static int flex_callback(r_device *decoder, bitbuffer_t *bitbuffer)
             // TODO: refactor to bitbuffer_decode_uart_row()
             unsigned len = bitbuffer->bits_per_row[i];
             bitbuffer_t tmp = {0};
-            len = extract_bytes_uart(bitbuffer->bb[i], 0, len, tmp.bb[0]);
+            len = extract_bytes_uart_8n1(bitbuffer->bb[i], 0, len, tmp.bb[0]);
             memcpy(bitbuffer->bb[i], tmp.bb[0], len); // safe to write over: can only be shorter
             bitbuffer->bits_per_row[i] = len * 8;
         }
